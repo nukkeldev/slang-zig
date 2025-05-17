@@ -1,7 +1,7 @@
 #include "slang-signal.h"
 
 #include "slang-exception.h"
-#include "stdio.h"
+#include <stdio.h>
 
 namespace Slang
 {
