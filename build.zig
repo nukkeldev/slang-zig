@@ -24,7 +24,7 @@ const ExternalDependencies = struct {
         });
     }
 
-    pub fn miniz(b: *std.Build, mod: *std.Build.Module) *std.Build.Step {
+    pub fn miniz(b: *std.Build, mod: *std.Build.Module) void {
         // We currently delegate the build process to CMake,
         // which we like want to keep doing for external dependencies.
 
@@ -36,9 +36,12 @@ const ExternalDependencies = struct {
             "-DINSTALL_PROJECT=OFF",
             "-DAMALGAMATE_SOURCES=ON",
             "-GUnix Makefiles",
+            "-Wno-deprecated",
         });
         build_miniz.setCwd(b.path("external/miniz"));
         _ = build_miniz.captureStdOut(); // Suppress output.
+
+        b.getInstallStep().dependOn(&build_miniz.step);
 
         // Add amalgamated files to the module.
         mod.addIncludePath(b.path("external/miniz/_build/amalgamation"));
@@ -46,10 +49,34 @@ const ExternalDependencies = struct {
             .root = b.path("external/miniz/_build/amalgamation"),
             .files = &.{"miniz.c"},
         });
-
-        return &build_miniz.step;
     }
 };
+
+fn registerSlangCapabilityGenerator(b: *std.Build, slang_mod: *std.Build.Module) !void {
+    const root_file = b.path("tools/slang-capability-generator/capability-generator-main.cpp");
+
+    const slang_capability_generator = b.addExecutable(.{
+        .name = "slang-capability-generator",
+        .root_source_file = root_file,
+        .target = slang_mod.resolved_target,
+        .optimize = slang_mod.optimize orelse .Debug,
+    });
+
+    _ = try collectIncludes(b.allocator, root_file.src_path.sub_path);
+
+    slang_capability_generator.addIncludePath(b.path("tools/slang-capability-generator"));
+
+    const run_slang_capability_generator = b.addRunArtifact(slang_capability_generator);
+    run_slang_capability_generator.addArgs(&.{
+        "source/slang/slang-capabilities.capdef",
+        "--target-directory",
+        "source/slang/capability",
+    });
+
+    // Register this as a top-level step.
+    const tls = b.step("generate-capabilities", "Generate capability files.");
+    tls.* = run_slang_capability_generator.step;
+}
 
 fn buildSlang(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options) !*std.Build.Step.Compile {
     _ = options;
@@ -144,16 +171,16 @@ fn buildSlang(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     // Add external dependencies to the module.
     ExternalDependencies.unordered_dense(b, slang_mod);
     ExternalDependencies.lz4(b, slang_mod);
-    const build_miniz = ExternalDependencies.miniz(b, slang_mod);
+    ExternalDependencies.miniz(b, slang_mod);
+
+    // Register generators.
+    try registerSlangCapabilityGenerator(b, slang_mod);
 
     // Add executable to the module.
     const slangc = b.addExecutable(.{
         .name = "slang",
         .root_module = slang_mod,
     });
-
-    // Add external build steps as dependent steps.
-    slangc.step.dependOn(build_miniz);
 
     // Add the source files.
     slangc.addCSourceFiles(.{
@@ -207,3 +234,47 @@ fn collectSources(allocator: std.mem.Allocator, dir_path: []const u8, exts: []co
 
     return files;
 }
+
+const IncludeGraph = struct {
+    // Member Variables
+    arena: std.heap.ArenaAllocator,
+    root: *Node,
+
+    // Type Definitions
+    const Self = @This();
+
+    const Node = struct {
+        parent: ?*Node,
+        include: Include,
+        children: []Node,
+
+        pub fn deinit(self: *Node, owner: std.mem.Allocator) void {
+            for (self.children) |node| node.deinit();
+            owner.free(self);
+        }
+    };
+
+    const Include = union(enum) {
+        Relative: struct {
+            resolved_path: std.fs.path,
+        },
+        System: []const u8,
+    };
+
+    // Functions
+
+    /// Constructs an include graph off of the `root_file_path`.
+    pub fn init(allocator: std.mem.Allocator, root_file_path: std.fs.path) Self {
+        var self = Self{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .root = undefined,
+        };
+
+        const alloc = self.arena.allocator();
+        self.root = try alloc.create(Node);
+
+        return self;
+    }
+
+    pub fn deinit(self: Self) void {}
+};
