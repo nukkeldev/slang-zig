@@ -1,6 +1,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const IncludeGraph = @import("include_graph").IncludeGraph;
+const INCLUDE_DIRS = &.{
+    "include#",
+    "source#",
+    "prelude#",
+    // "source/core#core",
+    // "source/slang-rt#slang-rt",
+    // "source/compiler-core#compiler-core",
+    // "source/slang-wasm#slang-wasm",
+    // "source/slang-glslang#slang-glslang",
+    // "source/slang-core-module#slang-core-module",
+    // "source/slang-glsl-module#slang-glsl-module",
+    // "source/slang#slang",
+    // "source/slangc#slangc",
+};
+
 const Options = struct {
     lib_type: std.builtin.LinkMode = .static,
 };
@@ -41,6 +57,7 @@ const ExternalDependencies = struct {
         build_miniz.setCwd(b.path("external/miniz"));
         _ = build_miniz.captureStdOut(); // Suppress output.
 
+        // TODO: This needs to be fixed lol
         b.getInstallStep().dependOn(&build_miniz.step);
 
         // Add amalgamated files to the module.
@@ -52,146 +69,164 @@ const ExternalDependencies = struct {
     }
 };
 
-fn registerSlangCapabilityGenerator(b: *std.Build, slang_mod: *std.Build.Module) !void {
-    const root_file = b.path("tools/slang-capability-generator/capability-generator-main.cpp");
+const ModuleOptions = struct {
+    root_source_file: []const u8,
+    flags: []const []const u8 = &.{},
 
-    const slang_capability_generator = b.addExecutable(.{
-        .name = "slang-capability-generator",
-        .root_source_file = root_file,
-        .target = slang_mod.resolved_target,
-        .optimize = slang_mod.optimize orelse .Debug,
-    });
+    additional_source_files: []const []const u8 = &.{},
+    additional_include_dirs: []const []const u8 = &.{},
 
-    _ = try collectIncludes(b.allocator, root_file.src_path.sub_path);
+    platform_specific_sources: []const PlatformSpecificPaths = &.{},
 
-    slang_capability_generator.addIncludePath(b.path("tools/slang-capability-generator"));
+    link_libcpp: bool = false,
+    link_libc: bool = false,
+    sanitize_c: bool = true,
 
-    const run_slang_capability_generator = b.addRunArtifact(slang_capability_generator);
-    run_slang_capability_generator.addArgs(&.{
-        "source/slang/slang-capabilities.capdef",
-        "--target-directory",
-        "source/slang/capability",
-    });
+    pre_processors: []const struct {
+        func: fn (*std.Build, *std.Build.Module) void,
+    },
 
-    // Register this as a top-level step.
-    const tls = b.step("generate-capabilities", "Generate capability files.");
-    tls.* = run_slang_capability_generator.step;
-}
+    debug: bool = false,
 
-fn buildSlang(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: Options) !*std.Build.Step.Compile {
-    _ = options;
+    pub const PlatformSpecificPaths = struct {
+        platform: std.Target.Os.Tag,
+        source_files: []const []const u8 = &.{},
+        include_dirs: []const []const u8 = &.{},
+    };
+};
 
+fn buildModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, comptime options: ModuleOptions) !*std.Build.Module {
     // Create the module.
-    const slang_mod = b.createModule(.{
+    const mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        // By default, it does not link to libc++ properly.
-        .link_libcpp = true,
+        .link_libc = options.link_libc,
+        .link_libcpp = options.link_libcpp,
+        .sanitize_c = options.sanitize_c,
     });
 
-    // Include the global headers.
-    slang_mod.addIncludePath(b.path("include"));
+    // Enable debugging if set.
+    IncludeGraph.DEBUG = options.debug;
 
-    // Include the headers and source files for `core`.
-    {
-        slang_mod.addIncludePath(b.path("source/core"));
+    // Construct a source graph off of the root source file.
+    const source_graph = try IncludeGraph.init(b.allocator, options.root_source_file, options.additional_include_dirs);
+    defer source_graph.deinit();
 
-        // Find all .cpp files in the directory.
-        // TODO: Write files to an index that can be embed.
-        var sources = try collectSources(b.allocator, "source/core", &.{".cpp"});
-        defer {
-            for (sources.items) |item| b.allocator.free(item);
-            sources.deinit();
-        }
+    // Add the sources and include directories to the module.
+    mod.addCSourceFiles(.{
+        .flags = options.flags,
+        .files = source_graph.get_sources(),
+    });
 
-        // Add platform-specific source files.
-        switch (builtin.os.tag) {
-            .windows => try sources.append(try b.allocator.dupe(u8, "windows/slang-win-process.cpp")),
-            .linux => try sources.append(try b.allocator.dupe(u8, "unix/slang-unix-process.cpp")),
-            else => {},
-        }
-
-        // Add the source files to the module.
-        slang_mod.addCSourceFiles(.{
-            .root = b.path("source/core"),
-            .files = sources.items,
-            .flags = &.{"-std=c++17"},
-        });
+    for (source_graph.get_include_paths()) |path| {
+        mod.addIncludePath(b.path(path));
     }
 
-    // Include the headers and source files for `compiler-core`.
-    {
-        slang_mod.addIncludePath(b.path("source/compiler-core"));
+    // Add platform-specific source files and include directories.
+    for (options.platform_specific_sources) |source| {
+        if (source.platform == builtin.os.tag) {
+            mod.addCSourceFiles(.{
+                .files = source.source_files,
+                .flags = options.flags,
+            });
 
-        // Find all .cpp files in the directory.
-        // TODO: Write files to an index that can be embed.
-        var sources = try collectSources(b.allocator, "source/compiler-core", &.{".cpp"});
-        defer {
-            for (sources.items) |item| b.allocator.free(item);
-            sources.deinit();
+            for (source.include_dirs) |path| {
+                mod.addIncludePath(b.path(path));
+            }
         }
+    }
 
-        // Add platform-specific source files.
-        switch (builtin.os.tag) {
-            .windows => {
-                slang_mod.addIncludePath(b.path("source/compiler-core/windows"));
-                try sources.append(try b.allocator.dupe(u8, "windows/slang-win-visual-studio-util.cpp"));
+    // Execute the module preprocessors.
+    inline for (options.pre_processors) |pre_processor| {
+        pre_processor.func(b, mod);
+    }
+
+    return mod;
+}
+
+fn runSlangCapabilityGenerator(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) !*std.Build.Step.Run {
+    const mod = try buildModule(
+        b,
+        target,
+        optimize,
+        .{
+            .root_source_file = "tools/slang-capability-generator/capability-generator-main.cpp",
+            .flags = &.{"-std=c++17"},
+            .additional_include_dirs = INCLUDE_DIRS,
+            .platform_specific_sources = &.{
+                .{
+                    .platform = .windows,
+                    .source_files = &.{ "source/core/windows/slang-win-process.cpp", "source/compiler-core/windows/slang-win-visual-studio-util.cpp" },
+                },
+                .{
+                    .platform = .linux,
+                    .source_files = &.{"source/core/unix/slang-unix-process.cpp"},
+                },
             },
-            else => {},
-        }
-
-        // Add the source files to the module.
-        slang_mod.addCSourceFiles(.{
-            .root = b.path("source/compiler-core"),
-            .files = sources.items,
-            .flags = &.{"-std=c++17"},
-        });
-    }
-
-    // Include the headers and source files for `slang`.
-    {
-        slang_mod.addIncludePath(b.path("source/slang"));
-
-        // Find all .cpp files in the directory.
-        // TODO: Write files to an index that can be embed.
-        var sources = try collectSources(b.allocator, "source/slang", &.{".cpp"});
-        defer {
-            for (sources.items) |item| b.allocator.free(item);
-            sources.deinit();
-        }
-
-        // Add the source files to the module.
-        slang_mod.addCSourceFiles(.{
-            .root = b.path("source/slang"),
-            .files = sources.items,
-            .flags = &.{"-std=c++17"},
-        });
-    }
-
-    // Add external dependencies to the module.
-    ExternalDependencies.unordered_dense(b, slang_mod);
-    ExternalDependencies.lz4(b, slang_mod);
-    ExternalDependencies.miniz(b, slang_mod);
-
-    // Register generators.
-    try registerSlangCapabilityGenerator(b, slang_mod);
-
-    // Add executable to the module.
-    const slangc = b.addExecutable(.{
-        .name = "slang",
-        .root_module = slang_mod,
-    });
-
-    // Add the source files.
-    slangc.addCSourceFiles(.{
-        .root = b.path("source"),
-        .files = &.{
-            "slangc/main.cpp",
+            .link_libcpp = true,
+            .sanitize_c = false,
+            .pre_processors = &.{
+                .{ .func = ExternalDependencies.lz4 },
+                .{ .func = ExternalDependencies.unordered_dense },
+                .{ .func = ExternalDependencies.miniz },
+            },
         },
-        .flags = &.{"-std=c++17"},
+    );
+
+    // Create the executable compile step.
+    const exe = b.addExecutable(.{
+        .name = "slang-capability-generator",
+        .root_module = mod,
     });
 
-    return slangc;
+    // Create the run step.
+    const run = b.addRunArtifact(exe);
+    run.addArgs(&.{ "source/slang/slang-capabilities.capdef", "--target-directory", "source/slang/capability", "--doc", "docs/user-guide/a3-02-reference-capability-atoms.md" });
+
+    // Make the directory for the generated files.
+    run.step.dependOn(&b.addSystemCommand(&.{ "mkdir", "-p", "source/slang/capability" }).step);
+
+    return run;
+}
+
+fn buildSlangc(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) !*std.Build.Step.Compile {
+    const mod = try buildModule(
+        b,
+        target,
+        optimize,
+        .{
+            .root_source_file = "source/slangc/main.cpp",
+            .flags = &.{"-std=c++17"},
+            .additional_include_dirs = INCLUDE_DIRS,
+            .additional_source_files = &.{"source/slang/slang-api.cpp"},
+            .platform_specific_sources = &.{
+                .{
+                    .platform = .windows,
+                    .source_files = &.{ "source/core/windows/slang-win-process.cpp", "source/compiler-core/windows/slang-win-visual-studio-util.cpp" },
+                },
+                .{
+                    .platform = .linux,
+                    .source_files = &.{"source/core/unix/slang-unix-process.cpp"},
+                },
+            },
+            .link_libcpp = true,
+            .sanitize_c = false,
+            .pre_processors = &.{
+                .{ .func = ExternalDependencies.lz4 },
+                .{ .func = ExternalDependencies.unordered_dense },
+                .{ .func = ExternalDependencies.miniz },
+            },
+            .debug = true,
+        },
+    );
+
+    // Create the executable compile step.
+    const exe = b.addExecutable(.{
+        .name = "slangc",
+        .root_module = mod,
+    });
+
+    return exe;
 }
 
 pub fn build(b: *std.Build) !void {
@@ -200,81 +235,11 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Create compile step to build slang's targets.
-    const slangc = try buildSlang(b, target, optimize, .{});
+    const run_slang_capability_generator = try runSlangCapabilityGenerator(b, target, optimize);
+
+    const slangc = try buildSlangc(b, target, optimize);
+    slangc.step.dependOn(&run_slang_capability_generator.step);
 
     // Add the executable as an install artifact.
     b.installArtifact(slangc);
 }
-
-// Utility Functions
-
-/// Iterates the files in `dir_path` for files ending in one of `exts` and returns a list of their relative paths.
-/// Each item must be free'd individually in addition to deinit'ing the list.
-fn collectSources(allocator: std.mem.Allocator, dir_path: []const u8, exts: []const []const u8) !std.ArrayList([]const u8) {
-    // Initialize an ArrayList for our file paths.
-    var files = std.ArrayList([]const u8).init(allocator);
-    errdefer files.deinit();
-
-    // Open the directory an initialize a walk.
-    const dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
-
-    // Iterate through the files in the directory.
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
-        // Skip entries that aren't files.
-        if (entry.kind != .file) continue;
-
-        // Check if the file extension is specified, if so add it to the files list.
-        for (exts) |ext| {
-            if (std.mem.endsWith(u8, entry.name, ext)) {
-                try files.append(try allocator.dupe(u8, entry.name));
-            }
-        }
-    }
-
-    return files;
-}
-
-const IncludeGraph = struct {
-    // Member Variables
-    arena: std.heap.ArenaAllocator,
-    root: *Node,
-
-    // Type Definitions
-    const Self = @This();
-
-    const Node = struct {
-        parent: ?*Node,
-        include: Include,
-        children: []Node,
-
-        pub fn deinit(self: *Node, owner: std.mem.Allocator) void {
-            for (self.children) |node| node.deinit();
-            owner.free(self);
-        }
-    };
-
-    const Include = union(enum) {
-        Relative: struct {
-            resolved_path: std.fs.path,
-        },
-        System: []const u8,
-    };
-
-    // Functions
-
-    /// Constructs an include graph off of the `root_file_path`.
-    pub fn init(allocator: std.mem.Allocator, root_file_path: std.fs.path) Self {
-        var self = Self{
-            .arena = std.heap.ArenaAllocator.init(allocator),
-            .root = undefined,
-        };
-
-        const alloc = self.arena.allocator();
-        self.root = try alloc.create(Node);
-
-        return self;
-    }
-
-    pub fn deinit(self: Self) void {}
-};

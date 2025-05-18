@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0x31af0a0b192e973c, // Changing this has security and trust implications.
     .minimum_zig_version = "0.14.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .include_graph = .{
+            .url = "git+https://github.com/nukkeldev/include-graph.git#4abe02efe97a9aef5ec513e30425833166a6ef41",
+            .hash = "include_graph-0.0.0-m9vssDhPAAB-QsFq9aV-tRNzqscaLKlDASuMBu0TZu0I",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
