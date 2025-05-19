@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const IncludeGraph = @import("include_graph").IncludeGraph;
-const INCLUDE_DIRS = &.{
+const INCLUDE_DIRS: []const []const u8 = &.{
     "include#",
     "source#",
     "prelude#",
@@ -13,7 +13,7 @@ const INCLUDE_DIRS = &.{
     // "source/slang-glslang#slang-glslang",
     // "source/slang-core-module#slang-core-module",
     // "source/slang-glsl-module#slang-glsl-module",
-    // "source/slang#slang",
+    "source/slang#slang",
     // "source/slangc#slangc",
 };
 
@@ -112,10 +112,16 @@ fn buildModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const source_graph = try IncludeGraph.init(b.allocator, options.root_source_file, options.additional_include_dirs);
     defer source_graph.deinit();
 
+    if (options.debug) std.debug.print("{}\n", .{source_graph});
+
     // Add the sources and include directories to the module.
     mod.addCSourceFiles(.{
         .flags = options.flags,
         .files = source_graph.get_sources(),
+    });
+    mod.addCSourceFiles(.{
+        .flags = options.flags,
+        .files = options.additional_source_files,
     });
 
     for (source_graph.get_include_paths()) |path| {
@@ -181,10 +187,10 @@ fn runSlangCapabilityGenerator(b: *std.Build, target: std.Build.ResolvedTarget, 
 
     // Create the run step.
     const run = b.addRunArtifact(exe);
-    run.addArgs(&.{ "source/slang/slang-capabilities.capdef", "--target-directory", "source/slang/capability", "--doc", "docs/user-guide/a3-02-reference-capability-atoms.md" });
+    run.addArgs(&.{ "source/slang/slang-capabilities.capdef", "--target-directory", "zig-out/generated/source/slang/capability", "--doc", "docs/user-guide/a3-02-reference-capability-atoms.md" });
 
     // Make the directory for the generated files.
-    run.step.dependOn(&b.addSystemCommand(&.{ "mkdir", "-p", "source/slang/capability" }).step);
+    run.step.dependOn(&b.addSystemCommand(&.{ "mkdir", "-p", "zig-out/generated/source/slang/capability" }).step);
 
     return run;
 }
@@ -198,7 +204,7 @@ fn buildSlangc(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .root_source_file = "source/slangc/main.cpp",
             .flags = &.{"-std=c++17"},
             .additional_include_dirs = INCLUDE_DIRS,
-            .additional_source_files = &.{"source/slang/slang-api.cpp"},
+            .additional_source_files = &.{ "source/slang/slang-api.cpp", "zig-out/generated/source/slang/capability/slang-lookup-capability-defs.cpp" },
             .platform_specific_sources = &.{
                 .{
                     .platform = .windows,
@@ -219,6 +225,12 @@ fn buildSlangc(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .debug = true,
         },
     );
+
+    // Add additional include directories that might not exist yet.
+    mod.addIncludePath(b.path("zig-out/generated/source/slang/capability"));
+
+    // Add pre-processor definitions.
+    mod.addCMacro("SLANG_DYNAMIC", "");
 
     // Create the executable compile step.
     const exe = b.addExecutable(.{

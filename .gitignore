@@ -99,3 +99,4 @@ vkd3d-proton.cache.write
 
 # zig
 .zig-cache
+zig-out
